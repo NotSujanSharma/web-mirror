@@ -103,6 +103,21 @@ class WebScraper:
             logger.error(f"Failed to save file {filepath}: {e}")
             return False
 
+    def should_process_href(self, href: str) -> bool:
+        """Determine if an href link should be processed for relative path conversion."""
+        if not href:
+            return False
+            
+        # Skip anchors, external protocols, and special links
+        if href.startswith(('data:', 'blob:', '#', 'mailto:', 'tel:', 'javascript:')):
+            return False
+            
+        # Skip if it's an external domain
+        if href.startswith(('http://', 'https://')):
+            return not self.is_same_domain(href)
+            
+        return True
+
     def analyze_page(self, content: str, url: str) -> Tuple[List[str], List[str], int]:
         """
         Analyze HTML content to find all relative paths, page links, and determine the deepest path level.
@@ -142,6 +157,56 @@ class WebScraper:
 
         return resources, page_links, max_depth
 
+    def get_relative_href(self, href: str, current_page_path: Path) -> Optional[str]:
+        """Convert an href to a relative path if it points to a downloaded page."""
+        try:
+            # Handle absolute URLs and root-relative URLs
+            if href.startswith(('http://', 'https://')):
+                if not self.is_same_domain(href):
+                    return None
+                parsed = urlparse(href)
+                href = parsed.path
+                if parsed.query:
+                    href = f"{href}?{parsed.query}"
+                if parsed.fragment:
+                    href = f"{href}#{parsed.fragment}"
+            elif href.startswith('/'):
+                # Remove leading slash for root-relative paths
+                href = href.lstrip('/')
+            
+            # Split off query parameters and fragments to handle them separately
+            path_part = href.split('?')[0].split('#')[0]
+            query_part = href[len(path_part):] if len(href) > len(path_part) else ''
+            
+            # Clean the path
+            clean_path = path_part.rstrip('/')
+            
+            # If this exact page has been downloaded, get its local path
+            if clean_path in self.url_to_filepath:
+                target_path = self.url_to_filepath[clean_path]
+            # If it's a directory-like path, check for index.html
+            elif not clean_path.endswith(('.html', '.htm')):
+                index_path = f"{clean_path}/index.html".lstrip('/')
+                if index_path in self.url_to_filepath:
+                    target_path = self.url_to_filepath[index_path]
+                else:
+                    # If we haven't found a match, try with .html extension
+                    html_path = f"{clean_path}.html"
+                    if html_path in self.url_to_filepath:
+                        target_path = self.url_to_filepath[html_path]
+                    else:
+                        return None
+            else:
+                return None
+                
+            # Calculate relative path from current page to target
+            rel_path = os.path.relpath(target_path, current_page_path.parent)
+            # Convert Windows path separators to forward slashes and add back query/fragment
+            return rel_path.replace(os.sep, '/') + query_part
+            
+        except ValueError:
+            return None
+
     def get_page_filepath(self, url_path: str) -> Path:
         """Determine the appropriate filepath for a page."""
         if not url_path or url_path == '/':
@@ -159,7 +224,12 @@ class WebScraper:
         soup = BeautifulSoup(content, 'html.parser')
         
         def fix_path(original_path: str) -> str:
-            relative_path = self.convert_to_relative_path(original_path)
+            # Handle root-relative paths
+            if original_path.startswith('/'):
+                relative_path = original_path.lstrip('/')
+            else:
+                relative_path = self.convert_to_relative_path(original_path)
+                
             if not relative_path:
                 return original_path
                 
@@ -181,8 +251,17 @@ class WebScraper:
         # Update href attributes
         for tag in soup.find_all(href=True):
             href = tag['href']
-            if href.endswith(('.css', '.js', '.ico', '.png', '.jpg', '.jpeg', '.gif', '.html', '.htm')):
+            if not self.should_process_href(href):
+                continue
+                
+            # Handle resource files
+            if href.endswith(('.css', '.js', '.ico', '.png', '.jpg', '.jpeg', '.gif')):
                 tag['href'] = fix_path(href)
+            # Handle page links
+            else:
+                relative_href = self.get_relative_href(href, current_page_path)
+                if relative_href:
+                    tag['href'] = relative_href
 
         return str(soup)
 
