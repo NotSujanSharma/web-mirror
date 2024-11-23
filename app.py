@@ -1,11 +1,12 @@
 import requests
 import re
 import os
-from typing import Optional, List, Set, Tuple
+from typing import Optional, List, Set, Tuple, Dict
 from urllib.parse import urljoin, urlparse, unquote
 from pathlib import Path
 import logging
 from bs4 import BeautifulSoup
+from collections import deque
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,6 +21,9 @@ class WebScraper:
         self.output_dir = Path(output_dir)
         self.session = requests.Session()
         self.processed_urls: Set[str] = set()
+        self.processed_resources: Set[str] = set()
+        self.page_queue: deque = deque()
+        self.url_to_filepath: Dict[str, Path] = {}
 
     def is_same_domain(self, url: str) -> bool:
         """Check if URL belongs to the same domain as base_url."""
@@ -27,7 +31,7 @@ class WebScraper:
 
     def convert_to_relative_path(self, url: str) -> Optional[str]:
         """Convert absolute URL to relative path if it's from the same domain."""
-        if url.startswith(('data:', 'blob:', '#')):
+        if url.startswith(('data:', 'blob:', '#', 'mailto:', 'tel:')):
             return None
             
         parsed_url = urlparse(url)
@@ -43,18 +47,42 @@ class WebScraper:
         return unquote(path.lstrip('/'))
 
     def fetch_content(self, url: str) -> Optional[str]:
-        """Fetch content from URL with error handling."""
+        """Fetch content from URL with enhanced error handling."""
         try:
-            response = self.session.get(url)
+            response = self.session.get(url, timeout=30)  # Added timeout
+            
+            # Log common HTTP errors but don't raise exception
+            if response.status_code == 404:
+                logger.warning(f"Page not found (404): {url}")
+                return None
+            elif response.status_code == 500:
+                logger.warning(f"Server error (500): {url}")
+                return None
+            elif response.status_code >= 400:
+                logger.warning(f"HTTP error {response.status_code}: {url}")
+                return None
+                
             response.raise_for_status()
             return response.text
+            
+        except requests.exceptions.Timeout:
+            logger.warning(f"Request timed out for {url}")
+            return None
+        except requests.exceptions.SSLError:
+            logger.warning(f"SSL verification failed for {url}")
+            return None
+        except requests.exceptions.ConnectionError:
+            logger.warning(f"Connection failed for {url}")
+            return None
         except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to fetch content from {url}: {e}")
+            logger.warning(f"Failed to fetch content from {url}: {e}")
             return None
 
     def download_file(self, url: str, filepath: Path) -> bool:
         """Download file from URL to specified path."""
-        if url in self.processed_urls:
+        resource_key = str(filepath.relative_to(self.output_dir))
+        
+        if resource_key in self.processed_resources:
             return True
             
         try:
@@ -64,7 +92,7 @@ class WebScraper:
             filepath.parent.mkdir(parents=True, exist_ok=True)
             filepath.write_bytes(response.content)
             
-            self.processed_urls.add(url)
+            self.processed_resources.add(resource_key)
             logger.info(f"Successfully downloaded: {filepath}")
             return True
             
@@ -75,53 +103,59 @@ class WebScraper:
             logger.error(f"Failed to save file {filepath}: {e}")
             return False
 
-    def analyze_paths(self, content: str) -> Tuple[List[str], int]:
+    def analyze_page(self, content: str, url: str) -> Tuple[List[str], List[str], int]:
         """
-        Analyze HTML content to find all relative paths and determine the deepest path level.
+        Analyze HTML content to find all relative paths, page links, and determine the deepest path level.
         """
         soup = BeautifulSoup(content, 'html.parser')
         resources = []
+        page_links = []
         max_depth = 0
 
-        def process_path(path: str) -> None:
+        def process_path(path: str, is_page: bool = False) -> None:
             nonlocal max_depth
             if not path:
                 return
                 
             relative_path = self.convert_to_relative_path(path)
             if relative_path:
-                resources.append(relative_path)
+                if is_page:
+                    page_links.append(relative_path)
+                else:
+                    resources.append(relative_path)
                 
                 # Calculate depth for relative paths
-                depth = 0
-                parts = path.split('/')
-                for part in parts:
-                    if part == '..':
-                        depth += 1
+                depth = len(Path(relative_path).parts)
                 max_depth = max(max_depth, depth)
 
         # Find all resources with src attribute
         for tag in soup.find_all(src=True):
             process_path(tag['src'])
 
-        # Find all stylesheet and other resource links
+        # Find all links and resources
         for tag in soup.find_all(href=True):
             href = tag['href']
             if href.endswith(('.css', '.js', '.ico', '.png', '.jpg', '.jpeg', '.gif')):
                 process_path(href)
+            elif href.endswith(('.html', '.htm')) or not href.endswith(('/', '.php', '.asp')):
+                process_path(href, True)
 
-        return resources, max_depth
+        return resources, page_links, max_depth
 
-    def calculate_html_location(self, max_depth: int) -> Path:
-        """Calculate the appropriate location for index.html based on the maximum path depth."""
-        html_dir = self.output_dir
-        if max_depth > 0:
-            for _ in range(max_depth):
-                html_dir = html_dir / "level"
-        return html_dir
+    def get_page_filepath(self, url_path: str) -> Path:
+        """Determine the appropriate filepath for a page."""
+        if not url_path or url_path == '/':
+            return self.output_dir / 'index.html'
+            
+        # Clean the path and ensure it ends with .html
+        clean_path = re.sub(r'\.\./', '', url_path)
+        if not clean_path.endswith(('.html', '.htm')):
+            clean_path = f"{clean_path.rstrip('/')}/index.html"
+            
+        return self.output_dir / clean_path
 
-    def adjust_resource_paths(self, content: str, resource_base: Path, html_location: Path) -> str:
-        """Adjust resource paths in HTML content based on the HTML file's location."""
+    def adjust_resource_paths(self, content: str, current_page_path: Path) -> str:
+        """Adjust resource and link paths in HTML content based on the current page location."""
         soup = BeautifulSoup(content, 'html.parser')
         
         def fix_path(original_path: str) -> str:
@@ -129,84 +163,96 @@ class WebScraper:
             if not relative_path:
                 return original_path
                 
-            # Convert the resource path to absolute path
-            abs_resource_path = resource_base / relative_path
-            
-            # Calculate relative path from HTML location to resource
+            # For resources, use the path relative to current page
+            target_path = self.output_dir / relative_path
+            if relative_path in self.url_to_filepath:
+                target_path = self.url_to_filepath[relative_path]
+                
             try:
-                # Get the relative path and ensure it doesn't start with '/'
-                rel_path = os.path.relpath(abs_resource_path, html_location)
-                # Make sure path uses forward slashes for web compatibility
+                rel_path = os.path.relpath(target_path, current_page_path.parent)
                 return rel_path.replace(os.sep, '/')
             except ValueError:
                 return original_path
 
         # Update src attributes
         for tag in soup.find_all(src=True):
-            src = tag['src']
-            new_path = fix_path(src)
-            if new_path != src:
-                tag['src'] = new_path
+            tag['src'] = fix_path(tag['src'])
 
         # Update href attributes
         for tag in soup.find_all(href=True):
             href = tag['href']
-            if href.endswith(('.css', '.js', '.ico', '.png', '.jpg', '.jpeg', '.gif')):
-                new_path = fix_path(href)
-                if new_path != href:
-                    tag['href'] = new_path
+            if href.endswith(('.css', '.js', '.ico', '.png', '.jpg', '.jpeg', '.gif', '.html', '.htm')):
+                tag['href'] = fix_path(href)
 
         return str(soup)
 
-    def process_resource(self, resource_path: str) -> None:
-        """Process a single resource path."""
-        # Construct full URL for downloading
-        full_url = urljoin(self.base_url, resource_path)
+    def process_page(self, url_path: str) -> None:
+        """Process a single page and its resources with error handling."""
+        full_url = urljoin(self.base_url, url_path)
+        if full_url in self.processed_urls:
+            return
+            
+        logger.info(f"Processing page: {full_url}")
         
-        # Clean path for local storage
-        clean_path = re.sub(r'\.\./', '', resource_path)
-        local_path = self.output_dir / clean_path
-        
-        self.download_file(full_url, local_path)
+        try:
+            content = self.fetch_content(full_url)
+            if not content:
+                logger.info(f"Skipping {full_url} due to fetch error")
+                self.processed_urls.add(full_url)  # Mark as processed to avoid retries
+                return
+
+            # Mark URL as processed
+            self.processed_urls.add(full_url)
+            
+            # Analyze page content
+            resources, page_links, _ = self.analyze_page(content, full_url)
+            
+            # Download resources with error handling
+            for resource in resources:
+                try:
+                    resource_url = urljoin(self.base_url, resource)
+                    resource_path = self.output_dir / resource
+                    self.download_file(resource_url, resource_path)
+                except Exception as e:
+                    logger.warning(f"Failed to process resource {resource}: {e}")
+                    continue
+
+            # Queue new pages
+            for link in page_links:
+                if urljoin(self.base_url, link) not in self.processed_urls:
+                    self.page_queue.append(link)
+
+            # Save the page
+            page_path = self.get_page_filepath(url_path)
+            self.url_to_filepath[url_path] = page_path
+            
+            # Adjust paths and save
+            adjusted_content = self.adjust_resource_paths(content, page_path)
+            try:
+                page_path.parent.mkdir(parents=True, exist_ok=True)
+                page_path.write_text(adjusted_content, encoding='utf-8')
+                logger.info(f"Saved page to {page_path}")
+            except OSError as e:
+                logger.error(f"Failed to save page {page_path}: {e}")
+                
+        except Exception as e:
+            logger.error(f"Unexpected error processing {full_url}: {e}")
+            self.processed_urls.add(full_url) 
 
     def run(self) -> None:
         """Main execution method."""
-        logger.info(f"Starting scraping from {self.base_url}")
+        logger.info(f"Starting multi-page scraping from {self.base_url}")
         
-        # Fetch main content
-        content = self.fetch_content(self.base_url)
-        if not content:
-            logger.error("Failed to fetch main content. Exiting.")
-            return
-
-        # Analyze paths and determine HTML location
-        resources, max_depth = self.analyze_paths(content)
-        logger.info(f"Found {len(resources)} resources with maximum depth of {max_depth}")
-
-        # Calculate appropriate HTML location
-        html_location = self.calculate_html_location(max_depth)
-        html_location.mkdir(parents=True, exist_ok=True)
-
-        # Process all resources first (store them in base directory)
-        for resource in resources:
-            self.process_resource(resource)
-
-        # Adjust paths in HTML content based on its location
-        adjusted_content = self.adjust_resource_paths(
-            content,
-            self.output_dir,
-            html_location
-        )
+        # Start with the base URL
+        self.page_queue.append('')  # Empty string represents the base URL
         
-        # Save main HTML file
-        index_path = html_location / 'index.html'
-        try:
-            index_path.write_text(adjusted_content, encoding='utf-8')
-            logger.info(f"Successfully saved main HTML file to {index_path}")
-        except OSError as e:
-            logger.error(f"Failed to save main HTML file: {e}")
+        # Process pages breadth-first
+        while self.page_queue:
+            url_path = self.page_queue.popleft()
+            self.process_page(url_path)
 
         logger.info("Scraping completed")
+        logger.info(f"Processed {len(self.processed_urls)} pages and {len(self.processed_resources)} resources")
 
 def main():
     # Configuration
