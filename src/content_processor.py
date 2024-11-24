@@ -4,13 +4,25 @@ from pathlib import Path
 from src.utils.url_helpers import convert_to_relative_path, should_process_href
 from src.utils.path_helpers import get_relative_href
 import os
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+import asyncio
 
 class ContentProcessor:
     def __init__(self, base_domain: str, output_dir: Path):
         self.base_domain = base_domain
         self.output_dir = output_dir
+        self.executor = ThreadPoolExecutor(max_workers=4)  # For CPU-bound tasks
 
-    def analyze_page(self, content: str, url: str) -> Tuple[List[str], List[str], int]:
+    async def analyze_page(self, content: str, url: str) -> Tuple[List[str], List[str], int]:
+        """Analyze HTML content asynchronously using ThreadPoolExecutor for CPU-bound parsing."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self.executor, 
+            partial(self._analyze_page_sync, content, url)
+        )
+
+    def _analyze_page_sync(self, content: str, url: str) -> Tuple[List[str], List[str], int]:
         """Analyze HTML content to find all relative paths, page links, and determine the deepest path level."""
         soup = BeautifulSoup(content, 'html.parser')
         resources = []
@@ -44,7 +56,15 @@ class ContentProcessor:
 
         return resources, page_links, max_depth
 
-    def adjust_resource_paths(self, content: str, current_page_path: Path, url_to_filepath: dict) -> str:
+    async def adjust_resource_paths(self, content: str, current_page_path: Path, url_to_filepath: dict) -> str:
+        """Adjust resource paths asynchronously."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self.executor,
+            partial(self._adjust_resource_paths_sync, content, current_page_path, url_to_filepath)
+        )
+        
+    def _adjust_resource_paths_sync(self, content: str, current_page_path: Path, url_to_filepath: dict) -> str:
         """Adjust resource and link paths in HTML content based on the current page location."""
         soup = BeautifulSoup(content, 'html.parser')
         

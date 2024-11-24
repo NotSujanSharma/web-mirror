@@ -1,59 +1,78 @@
-import requests
 from pathlib import Path
+from typing import Set
 import logging
 from typing import Optional
 from src.config import DEFAULT_CONFIG
+import backoff 
+import aiohttp
+import asyncio
 
 logger = logging.getLogger(__name__)
 
 class Downloader:
-    def __init__(self, session: requests.Session):
-        self.session = session
-        self.timeout = DEFAULT_CONFIG['REQUEST_TIMEOUT']
+    def __init__(self):
+        self.timeout = aiohttp.ClientTimeout(total=DEFAULT_CONFIG['REQUEST_TIMEOUT'])
+        self.semaphore = asyncio.Semaphore(DEFAULT_CONFIG['MAX_CONCURRENT_REQUESTS'])
+        self.session = None
 
-    def fetch_content(self, url: str) -> Optional[str]:
-        """Fetch content from URL with enhanced error handling."""
-        try:
-            response = self.session.get(url, timeout=self.timeout)
-            
-            if response.status_code == 404:
-                logger.warning(f"Page not found (404): {url}")
-                return None
-            elif response.status_code == 500:
-                logger.warning(f"Server error (500): {url}")
-                return None
-            elif response.status_code >= 400:
-                logger.warning(f"HTTP error {response.status_code}: {url}")
-                return None
-                
-            response.raise_for_status()
-            return response.text
-            
-        except (requests.exceptions.Timeout,
-                requests.exceptions.SSLError,
-                requests.exceptions.ConnectionError,
-                requests.exceptions.RequestException) as e:
-            logger.warning(f"Failed to fetch content from {url}: {e}")
-            return None
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession(timeout=self.timeout)
+        return self
 
-    def download_file(self, url: str, filepath: Path, processed_resources: set) -> bool:
-        """Download file from URL to specified path."""
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
+
+    @backoff.on_exception(
+        backoff.expo,
+        (aiohttp.ClientError, asyncio.TimeoutError),
+        max_tries=DEFAULT_CONFIG['MAX_RETRIES'],
+        max_time=30
+    )
+    async def fetch_content(self, url: str) -> Optional[str]:
+        """Fetch content from URL with retries and error handling."""
+        async with self.semaphore:
+            try:
+                async with self.session.get(url) as response:
+                    if response.status >= 400:
+                        logger.warning(f"HTTP error {response.status}: {url}")
+                        return None
+                    return await response.text()
+            except Exception as e:
+                logger.warning(f"Failed to fetch content from {url}: {e}")
+                return None
+
+    @backoff.on_exception(
+        backoff.expo,
+        (aiohttp.ClientError, asyncio.TimeoutError),
+        max_tries=DEFAULT_CONFIG['MAX_RETRIES'],
+        max_time=30
+    )
+
+    async def download_file(self, url: str, filepath: Path, processed_resources: Set[str]) -> bool:
+        """Download file from URL with streaming and retry capability."""
         resource_key = str(filepath.relative_to(filepath.parent.parent))
         
         if resource_key in processed_resources:
             return True
-            
-        try:
-            response = self.session.get(url)
-            response.raise_for_status()
-            
-            filepath.parent.mkdir(parents=True, exist_ok=True)
-            filepath.write_bytes(response.content)
-            
-            processed_resources.add(resource_key)
-            logger.info(f"Successfully downloaded: {filepath}")
-            return True
-            
-        except (requests.exceptions.RequestException, OSError) as e:
-            logger.error(f"Failed to download/save {url} to {filepath}: {e}")
-            return False
+
+        async with self.semaphore:
+            try:
+                async with self.session.get(url) as response:
+                    if response.status != 200:
+                        return False
+
+                    filepath.parent.mkdir(parents=True, exist_ok=True)
+                    
+                    # Stream the response content
+                    with filepath.open('wb') as f:
+                        async for chunk in response.content.iter_chunked(DEFAULT_CONFIG['CHUNK_SIZE']):
+                            f.write(chunk)
+
+                processed_resources.add(resource_key)
+                logger.info(f"Successfully downloaded: {filepath}")
+                return True
+
+            except Exception as e:
+                logger.error(f"Failed to download {url}: {e}")
+                return False
