@@ -1,4 +1,4 @@
-# Web Mirror
+# Web Mirror - Async
 
 ## Instructions
 ### Install dependencies
