@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 # Default configuration
 DEFAULT_CONFIG = {
-    'TARGET_URL': 'https://swastikcollege.edu.np/',
+    'TARGET_URL': 'https://theuselessweb.com/',
     'OUTPUT_DIR': 'downloaded_site',
     'REQUEST_TIMEOUT': 30,
     'MAX_CONCURRENT_REQUESTS': 10,  # Maximum number of concurrent requests
