@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 # Default configuration
 DEFAULT_CONFIG = {
-    'TARGET_URL': 'https://ableproadmin.com/dashboard/',
+    'TARGET_URL': 'https://theuselessweb.com/',
     'OUTPUT_DIR': 'downloaded_site/site1',
     'REQUEST_TIMEOUT': 30,
     'ALLOWED_EXTENSIONS': {
